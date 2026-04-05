@@ -9,12 +9,26 @@ import logging
 import signal
 import sys
 import msvcrt
+import tempfile
+import base64
+import json
 from datetime import datetime
 
 BOT_TOKEN = "__BOT_TOKEN__"
 ALLOWED_USER_ID = __ALLOWED_USER_ID__
 PROJECT_DIR = r"__PROJECT_DIR__"
 CLAUDE_PROJECTS_DIR = r"__CLAUDE_PROJECTS_DIR__"
+
+# ── Claude binary path (CRITICAL on Windows) ──────────────────────────────────
+# .cmd files CANNOT be executed by subprocess.Popen with a list on Windows.
+# Python's CreateProcess looks for .exe files, not .cmd.
+# Always use ["cmd", "/c", "full\path\to\claude.cmd"] — never just ["claude", ...].
+# The path below must point to the actual claude.cmd in the fnm/npm install dir.
+CLAUDE_CMD = [
+    "cmd", "/c",
+    r"__CLAUDE_CMD_PATH__"   # e.g. C:\Users\zs\AppData\Roaming\fnm\node-versions\v24.14.1\installation\claude.cmd
+]
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 OFFSET_FILE = os.path.join(SCRIPT_DIR, "telegram_offset.txt")
 LOG_FILE = os.path.join(SCRIPT_DIR, "telegram_bot.log")
@@ -212,6 +226,36 @@ def send_file(chat_id, filename, content):
         return False
 
 
+def download_photo(message):
+    """Download the highest-res photo from a Telegram message. Returns local file path or None."""
+    try:
+        # Pick the largest photo (last in array = highest resolution)
+        photos = message.get("photo", [])
+        if not photos:
+            return None
+        file_id = photos[-1]["file_id"]
+
+        # Get download path from Telegram
+        r = requests.get(f"{BASE_URL}/getFile", params={"file_id": file_id}, timeout=10)
+        if not r.ok:
+            log.error(f"getFile failed: {r.text}")
+            return None
+        file_path = r.json()["result"]["file_path"]
+        download_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+
+        # Download to a temp file
+        img_data = requests.get(download_url, timeout=30).content
+        ext = os.path.splitext(file_path)[-1] or ".jpg"
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext, prefix="tg_photo_")
+        tmp.write(img_data)
+        tmp.close()
+        log.info(f"Photo saved to: {tmp.name}")
+        return tmp.name
+    except Exception as e:
+        log.error(f"download_photo failed: {e}")
+        return None
+
+
 def get_updates(offset=None):
     params = {"timeout": 30, "allowed_updates": ["message"]}
     if offset is not None:
@@ -226,8 +270,21 @@ def get_updates(offset=None):
 
 # ── Claude runner ─────────────────────────────────────────────────────────────
 
-def run_claude(message, chat_id):
-    """Run claude --resume <latest session> -p <message>. Returns response text."""
+MEDIA_TYPES = {'.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
+               '.gif': 'image/gif', '.webp': 'image/webp'}
+
+
+def run_claude(message, chat_id, image_path=None):
+    """Run claude. Images sent as base64 via stream-json (same as desktop app).
+
+    KEY DESIGN DECISIONS:
+    - Text messages use --resume <session_id> for full session continuity.
+    - Images use --input-format stream-json (base64 over stdin) WITHOUT --resume.
+      Reason: combining stream-json with --resume causes an indefinite hang when
+      the session file is large (Claude tries to load the full context + the image).
+    - stream-json requires ALL THREE flags: -p, --input-format stream-json,
+      --output-format stream-json, AND --verbose. Missing any one causes failure.
+    """
     global current_proc
 
     session_id = get_latest_session_id()
@@ -236,36 +293,76 @@ def run_claude(message, chat_id):
 
     log.info(f"Resuming session: {session_id}")
 
-    # Session size warning
     line_count = get_session_line_count(session_id)
     if line_count > SESSION_LINE_WARN_THRESHOLD:
         send_message(chat_id,
                      f"Warning: session file is {line_count:,} lines long. "
                      f"Consider running <code>/compact</code> in Claude Code to keep responses fast.",
                      use_html=True)
-
     try:
-        proc = subprocess.Popen(
-            ["claude", "--resume", session_id, "-p", message, "--dangerously-skip-permissions"],
-            cwd=PROJECT_DIR,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-        with current_proc_lock:
-            current_proc = proc
+        if image_path:
+            # Send image as base64 via stream-json — exactly like the desktop app
+            ext = os.path.splitext(image_path)[1].lower()
+            media_type = MEDIA_TYPES.get(ext, 'image/jpeg')
+            with open(image_path, 'rb') as f:
+                img_b64 = base64.b64encode(f.read()).decode('utf-8')
+            log.info(f"Sending image as {media_type} via stream-json")
 
-        stdout, stderr = proc.communicate(timeout=300)
+            stdin_payload = json.dumps({'type': 'user', 'message': {'role': 'user', 'content': [
+                {'type': 'image', 'source': {'type': 'base64', 'media_type': media_type, 'data': img_b64}},
+                {'type': 'text', 'text': message or 'Describe this image.'}
+            ]}})
 
-        with current_proc_lock:
-            current_proc = None
+            # NOTE: Do NOT add --resume here. stream-json + --resume hangs indefinitely
+            # when the session file is large.
+            proc = subprocess.Popen(
+                CLAUDE_CMD + ['-p',
+                              '--input-format', 'stream-json',
+                              '--output-format', 'stream-json',
+                              '--verbose', '--dangerously-skip-permissions'],
+                cwd=PROJECT_DIR,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True, encoding='utf-8', errors='replace'
+            )
+            with current_proc_lock:
+                current_proc = proc
+            stdout, stderr = proc.communicate(input=stdin_payload, timeout=300)
+            with current_proc_lock:
+                current_proc = None
 
-        if proc.returncode == -15:   # SIGTERM from /cancel
+            # Parse stream-json output to extract text
+            parts = []
+            for line in stdout.splitlines():
+                try:
+                    obj = json.loads(line)
+                    if obj.get('type') == 'assistant':
+                        for block in obj.get('message', {}).get('content', []):
+                            if block.get('type') == 'text':
+                                parts.append(block['text'])
+                except Exception:
+                    pass
+            output = '\n'.join(parts).strip()
+
+        else:
+            # Text-only: standard --resume mode for full session continuity
+            proc = subprocess.Popen(
+                CLAUDE_CMD + ['--resume', session_id, '-p', message, '--dangerously-skip-permissions'],
+                cwd=PROJECT_DIR,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True, encoding='utf-8', errors='replace'
+            )
+            with current_proc_lock:
+                current_proc = proc
+            stdout, stderr = proc.communicate(timeout=300)
+            with current_proc_lock:
+                current_proc = None
+            output = stdout.strip()
+
+        if proc.returncode == -15:
             return "Cancelled."
-
-        output = stdout.strip()
         if not output and stderr:
             output = f"Error:\n{stderr.strip()}"
         if not output:
@@ -279,26 +376,7 @@ def run_claude(message, chat_id):
                 current_proc = None
         return "Timed out after 5 minutes."
     except FileNotFoundError:
-        try:
-            proc = subprocess.Popen(
-                f'claude --resume {session_id} -p "{message}" --dangerously-skip-permissions',
-                cwd=PROJECT_DIR,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                shell=True,
-            )
-            with current_proc_lock:
-                current_proc = proc
-            stdout, stderr = proc.communicate(timeout=300)
-            with current_proc_lock:
-                current_proc = None
-            output = stdout.strip()
-            return output if output else "(No response received)"
-        except Exception as e:
-            return f"`claude` not found in PATH.\nError: {e}"
+        return f"`claude.cmd` not found at: {CLAUDE_CMD[2]}\nCheck CLAUDE_CMD path in the script."
     except Exception as e:
         with current_proc_lock:
             current_proc = None
@@ -308,16 +386,29 @@ def run_claude(message, chat_id):
 # ── Worker thread ─────────────────────────────────────────────────────────────
 
 def worker():
-    """Process one message at a time — prevents concurrent --resume conflicts."""
+    """Process one message at a time — prevents concurrent --resume conflicts.
+
+    IMPORTANT: Unpack `item` OUTSIDE the inner try block. If unpacking is inside
+    try and queue.get() raises, `chat_id`/`text`/`image_path` are never defined,
+    causing NameError in the except/finally block.
+
+    IMPORTANT: Do NOT delete image_path in the finally block. On Windows, the
+    subprocess may still have the file handle open when finally runs, causing
+    a PermissionError. Windows Temp folder is cleaned up by the OS periodically.
+    """
     while not shutdown_event.is_set():
+        item = None
         try:
-            chat_id, text = message_queue.get(timeout=1)
+            item = message_queue.get(timeout=1)
         except queue.Empty:
             continue
+
+        # Unpack outside try so variables are always defined for finally
+        chat_id, text, image_path = item
         try:
             send_typing(chat_id)
             placeholder_id = send_placeholder(chat_id)
-            response = run_claude(text, chat_id)
+            response = run_claude(text, chat_id, image_path=image_path)
 
             # Long response → send as file
             if len(response) > MAX_INLINE_LENGTH:
@@ -326,9 +417,8 @@ def worker():
                 sent = send_file(chat_id, filename, response)
                 if placeholder_id:
                     edit_message(chat_id, placeholder_id, "Response attached as file.", use_html=False)
-                elif not sent:
-                    # Fallback: send inline anyway
-                    edit_message(chat_id, placeholder_id, response)
+                if not sent and not placeholder_id:
+                    send_message(chat_id, response)
             else:
                 if placeholder_id:
                     edit_message(chat_id, placeholder_id, response)
@@ -341,6 +431,8 @@ def worker():
             send_message(chat_id, f"Internal error: {e}", use_html=False)
         finally:
             message_queue.task_done()
+            # Do NOT delete image_path here — Windows may still have the file
+            # handle open. Temp files are cleaned by Windows automatically.
 
 
 # ── Graceful shutdown ─────────────────────────────────────────────────────────
@@ -421,13 +513,16 @@ def main():
 
                 user_id = message.get("from", {}).get("id")
                 chat_id = message.get("chat", {}).get("id")
-                text = message.get("text", "").strip()
+                text = message.get("text") or message.get("caption") or ""
+                text = text.strip()
+                has_photo = bool(message.get("photo"))
 
                 if user_id != ALLOWED_USER_ID:
                     log.warning(f"Ignored message from unknown user {user_id}")
                     continue
 
-                if not text:
+                # Must have text, a photo, or both
+                if not text and not has_photo:
                     continue
 
                 # Save chat_id for notifications
@@ -450,7 +545,7 @@ def main():
 
                 if text == "/start":
                     send_message(chat_id,
-                                 "Hi Evan! I'm your Claude Code assistant.\n\nSend any message and I'll run it in your AI Trainer session.\n\nType /help for commands.",
+                                 "Hi! I'm your Claude Code assistant.\n\nSend any message and I'll run it in your active Claude Code session.\n\nType /help for commands.",
                                  use_html=False)
                     continue
 
@@ -461,7 +556,8 @@ def main():
                                  "/session — show active session ID\n"
                                  "/cancel — abort the current Claude task\n"
                                  "/help — show this message\n\n"
-                                 "Any other message is sent to Claude.",
+                                 "Send any text message to Claude.\n"
+                                 "Send a photo (with optional caption) and Claude will analyse it.",
                                  use_html=True)
                     continue
 
@@ -494,8 +590,18 @@ def main():
                             send_message(chat_id, "Nothing is running right now.", use_html=False)
                     continue
 
+                # ── Download photo if present ─────────────────────────────────
+                image_path = None
+                if has_photo:
+                    image_path = download_photo(message)
+                    if not image_path:
+                        send_message(chat_id, "Could not download the image. Please try again.", use_html=False)
+                        continue
+                    if not text:
+                        text = "Please analyse this image and describe what you see."
+
                 # ── Queue message ─────────────────────────────────────────────
-                log.info(f"[IN]  {text[:100]}")
+                log.info(f"[IN]  {'[photo] ' if has_photo else ''}{text[:100]}")
                 q_size = message_queue.qsize()
                 if q_size >= 5:
                     send_message(chat_id, "Queue is full (5 pending). Please wait.", use_html=False)
@@ -503,9 +609,9 @@ def main():
                     send_message(chat_id,
                                  f"Queued (position {q_size + 1}) — waiting for current task to finish.",
                                  use_html=False)
-                    message_queue.put((chat_id, text))
+                    message_queue.put((chat_id, text, image_path))
                 else:
-                    message_queue.put((chat_id, text))
+                    message_queue.put((chat_id, text, image_path))
 
     finally:
         release_lock(lock_fh)
